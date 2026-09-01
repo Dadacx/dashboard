@@ -23,7 +23,6 @@ if (fs.existsSync(TOKEN_PATH)) {
     const tokenData = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
     spotifyApi.setRefreshToken(tokenData.refresh_token);
 
-    // Błyskawiczne pobranie nowego tokenu dostępu
     spotifyApi.refreshAccessToken().then(data => {
         spotifyApi.setAccessToken(data.body['access_token']);
         console.log('Automatycznie przywrócono sesję Spotify z pliku!');
@@ -59,7 +58,6 @@ async function addToPlaylists(playlistIds, tracksUri) {
     return { success: true, details: responses };
 }
 
-// Endpoint 1: Generowanie linku do logowania Spotify
 app.get('/login', (req, res) => {
     const scopes = [
         'user-read-playback-state',
@@ -71,7 +69,6 @@ app.get('/login', (req, res) => {
     res.redirect(spotifyApi.createAuthorizeURL(scopes));
 });
 
-// Endpoint 2: Obsługa powrotu po logowaniu i zapisanie tokenów
 app.get('/callback', (req, res) => {
     const code = req.query.code;
     spotifyApi.authorizationCodeGrant(code).then(data => {
@@ -81,14 +78,12 @@ app.get('/callback', (req, res) => {
         spotifyApi.setAccessToken(accessToken);
         spotifyApi.setRefreshToken(refreshToken);
 
-        // Zapis do pliku
         fs.writeFileSync(TOKEN_PATH, JSON.stringify({ refresh_token: refreshToken }));
 
         res.send('Autoryzacja udana! Token zapisany na stałe. Możesz zamknąć tę kartę.');
     }).catch(err => res.send(`Błąd: ${err}`));
 });
 
-// Endpoint 3: Pobieranie parametrów PC (CPU i RAM)
 app.get('/api/stats', async (req, res) => {
     try {
         const cpu = await si.currentLoad();
@@ -97,13 +92,16 @@ app.get('/api/stats', async (req, res) => {
         res.json({
             cpuLoad: Math.round(cpu.currentLoad),
             memUsed: Math.round((mem.active / mem.total) * 100),
+            gpuLoad: gpu.controllers.map(controller => ({
+                model: controller.model,
+                load: controller.utilizationGpu
+            }))
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-// Endpoint 4: Pobieranie aktualnie odtwarzanej piosenki
 app.get('/api/spotify/current', async (req, res) => {
     try {
         const data = await spotifyApi.getMyCurrentPlaybackState();
@@ -147,29 +145,54 @@ app.post('/api/spotify/add_current_to_playlists/:playlists_ids', async (req, res
     }
 })
 
-// Endpoint 5: Sterowanie muzyką
 app.post('/api/spotify/:action', async (req, res) => {
     const action = req.params.action;
     try {
+        const data = await spotifyApi.getMyCurrentPlaybackState();
         if (action === 'play') await spotifyApi.play();
         if (action === 'pause') await spotifyApi.pause();
         if (action === 'next') await spotifyApi.skipToNext();
-        if (action === 'prev') await spotifyApi.skipToPrevious();
-        if (action === 'save') {
-            const currentTrack = await spotifyApi.getMyCurrentPlaybackState();
-            if (currentTrack.body && currentTrack.body.item) {
-                await spotifyApi.addToMySavedTracks([currentTrack.body.item.id]);
+        if (action === 'prev') {
+            if (data.body && data.body.progress_ms > 10000) {
+                spotifyApi.seek(0);
+                return res.sendStatus(200);
+            } else {
+                await spotifyApi.skipToPrevious();
             }
         }
         res.sendStatus(200);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        if (e.statusCode === 404) {
+            try {
+                console.log("Urządzenie uśpione. Próbuję wybudzić...");
+                
+                const devicesData = await spotifyApi.getMyDevices();
+                const devices = devicesData.body.devices;
+
+                if (devices.length > 0) {
+                    const targetDeviceId = devices[0].id;
+                    
+                    // Wysyłamy komendę Play z wymuszeniem konkretnego ID
+                    await spotifyApi.play({ device_id: targetDeviceId });
+                    
+                    console.log("Urządzenie wybudzone i odtwarzanie wznowione.");
+                    return res.status(200).json({ message: "Wybudzono urządzenie i wznowiono odtwarzanie" });
+                } else {
+                    return res.status(404).json({ error: "Brak włączonych urządzeń ze Spotify. Otwórz aplikację na komputerze." });
+                }
+            } catch (fallbackError) {
+                console.error("Błąd wybudzania:", fallbackError);
+                return res.status(500).json({ error: "Nie udało się wybudzić urządzenia." });
+            }
+        }
+        
+        // Obsługa innych błędów
+        console.error("Inny błąd odtwarzania:", e);
+        res.status(500).json({ error: "Wystąpił problem z odtwarzaniem." });
     }
 });
 
-// 1. Serwowanie statycznych plików Reacta pod ścieżką /app
 app.use('/app', express.static(path.join(__dirname, 'app')));
-
 // 2. Przekierowanie wszystkich zapytań z /app/cokolwiek do index.html (zapobiega błędom 404)
 app.use('/app', (req, res) => {
     res.sendFile(path.join(__dirname, 'app', 'index.html'));
