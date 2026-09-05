@@ -9,14 +9,19 @@ import nextIcon from './icons/next.svg';
 import prevIcon from './icons/prev.svg';
 import addIcon from './icons/add.svg';
 
-// WAŻNE: Zmień adres na lokalne IP swojego komputera (np. 192.168.0.15)
-const SERVER_URL = window.location.origin || window.prompt('Podaj adres serwera:', 'http://192.168.100.4:3100');
+const SERVER_URL = !window.location.origin.includes('localhost') ? window.location.origin : window.prompt('Podaj adres serwera:', 'http://192.168.100.4:3100');
 
 function App() {
     const [stats, setStats] = useState({ cpuLoad: 0, memUsed: 0, gpuLoad: [] });
     const [spotify, setSpotify] = useState({ isPlaying: false, title: 'Czekam na dane...' });
     const [isAwake, setIsAwake] = useState(false);
+    const [refreshInterval, setRefreshInterval] = useState(3);
+    const [ping, setPing] = useState(0);
     const noSleepRef = useRef(null);
+    const appStartTime = useRef(Date.now())
+    const lastWarningTime = useRef(0);
+    const pingAlert = 5000
+    // const REFRESH_INTERVAL = 3; // Czas odświeżania w sekundach
 
     useEffect(() => {
         // Inicjalizacja instancji
@@ -42,21 +47,70 @@ function App() {
 
     const fetchData = async () => {
         try {
-            const statsRes = await fetch(`${SERVER_URL}/api/stats`);
-            setStats(await statsRes.json());
+            const startTime = Date.now();
 
-            const spotifyRes = await fetch(`${SERVER_URL}/api/spotify/current`);
-            setSpotify(await spotifyRes.json());
+            // Puszczamy oba żądania do serwera w tym samym momencie
+            const [statsRes, spotifyRes] = await Promise.all([
+                fetch(`${SERVER_URL}/api/stats`),
+                fetch(`${SERVER_URL}/api/spotify/current`)
+            ]);
+
+            // Równolegle parsujemy odpowiedzi JSON
+            const [newStats, newSpotify] = await Promise.all([
+                statsRes.json(),
+                spotifyRes.json()
+            ]);
+
+            setStats(newStats);
+            setSpotify(newSpotify);
+
+            const currentPing = Date.now() - startTime;
+            setPing(currentPing);
+
+            if (currentPing > pingAlert /*refreshInterval * 1000*/) {
+                const now = Date.now();
+                const timeSinceStart = now - appStartTime.current;
+                const timeSinceLastWarning = now - lastWarningTime.current;
+
+                if (timeSinceStart > 10000 && timeSinceLastWarning > 15000) {
+                    showPopup({
+                        message: `Serwer jest obciążony (ping: ${currentPing} ms). Zalecane jest zwiększenie częstotliwości odświeżania.`,
+                        type: 'warning',
+                        duration: 10000,
+                        icon: true
+                    });
+                    lastWarningTime.current = now;
+                }
+            }
         } catch (error) {
             console.error('Brak połączenia z serwerem');
         }
     };
 
+    // useEffect(() => {
+    //     fetchData();
+    //     const interval = setInterval(fetchData, 3000);
+    //     return () => clearInterval(interval);
+    // }, []);
+
     useEffect(() => {
-        fetchData();
-        const interval = setInterval(fetchData, 3000);
-        return () => clearInterval(interval);
-    }, []);
+        let timeoutId;
+        let isActive = true;
+
+        const fetchDataLoop = async () => {
+            await fetchData();
+            if (!isActive) return;
+
+            timeoutId = setTimeout(fetchDataLoop, refreshInterval * 1000);
+        };
+
+        fetchDataLoop();
+
+        return () => {
+            isActive = false;
+            clearTimeout(timeoutId);
+        };
+    }, [refreshInterval]);
 
     const controlSpotify = async (action) => {
         await fetch(`${SERVER_URL}/api/spotify/${action}`, { method: 'POST' });
@@ -77,8 +131,16 @@ function App() {
     return (
         <div className="dashboard">
             <PopupManager />
-            <div style={{ position: 'absolute', top: '10px' }}>{new Date().toLocaleTimeString()}</div>
-            <button className="screen-lock-btn" onClick={toggleScreenLock} style={{position: 'absolute', top: '10px', left:'10px'}}>
+            <div style={{ position: 'absolute', top: '10px', textAlign: 'center' }} title='CCO (Całkowity czas odświeżania)'>Ping: {ping} ms<br /> CCO: {(refreshInterval + ping / 1000).toFixed(3)}s</div>
+            <button style={{ position: 'absolute', top: '10px', right: '10px' }} onClick={() => {
+                const newInterval = prompt('Podaj nową częstotliwość odświeżania (w sekundach):');
+                if (newInterval && !isNaN(newInterval)) {
+                    setRefreshInterval(parseInt(newInterval));
+                }
+            }}>
+                Czestotliwość odświeżania: {refreshInterval}s
+            </button>
+            <button className="screen-lock-btn" onClick={toggleScreenLock} style={{ position: 'absolute', top: '10px', left: '10px' }}>
                 {isAwake ? 'Wyłącz blokadę ekranu' : 'Włącz blokadę ekranu'}
             </button>
 
@@ -86,7 +148,7 @@ function App() {
                 <h2>Osiągi PC</h2>
                 <div className="stat">CPU: <span>{stats.cpuLoad}%</span></div>
                 <div className="stat">RAM: <span>{stats.memUsed}%</span></div>
-                {stats.gpuLoad.map(gpu => (
+                {stats.gpuLoad && stats.gpuLoad.map(gpu => (
                     <div key={gpu.model} className="stat">GPU ({gpu.model}): <span>{gpu.load || 'N/A'}%</span></div>
                 ))}
             </div>

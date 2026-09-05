@@ -5,11 +5,18 @@ const si = require('systeminformation');
 const SpotifyWebApi = require('spotify-web-api-node');
 const path = require('path');
 const fs = require('fs');
+const colors = require('colors');
+colors.enable()
+const log = require('./log');
+log.debugEnabled = true;
 
 const app = express();
 app.use(cors());
+
 const PORT = 3100 //zmienić też w api spotify
 const TOKEN_PATH = './token.json';
+const cachedStatsUpdateInterval = 1000;
+let cachedStats = { cpuLoad: 0, memUsed: 0, gpuLoad: [] };
 
 // Konfiguracja Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -25,17 +32,44 @@ if (fs.existsSync(TOKEN_PATH)) {
 
     spotifyApi.refreshAccessToken().then(data => {
         spotifyApi.setAccessToken(data.body['access_token']);
-        console.log('Automatycznie przywrócono sesję Spotify z pliku!');
+        log.info('Automatycznie przywrócono sesję Spotify z pliku!');
     }).catch(err => {
-        console.error('Nie udało się odświeżyć zapisanego tokenu:', err);
+        log.error('Nie udało się odświeżyć zapisanego tokenu:', err);
     });
+} else {
+    log.info(`Brak zapisanego tokenu. Zaloguj się: http://localhost:${PORT}/login`);
 }
+
+async function updateStatsInBackground() {
+    try {
+        const [cpu, mem, gpu] = await Promise.all([
+            si.currentLoad(),
+            si.mem(),
+            si.graphics()
+        ]);
+        
+        cachedStats = {
+            cpuLoad: Math.round(cpu.currentLoad),
+            memUsed: Math.round((mem.active / mem.total) * 100),
+            gpuLoad: gpu.controllers.map(controller => ({
+                model: controller.model,
+                load: controller.utilizationGpu
+            }))
+        };
+    } catch (e) {
+        log.error("Błąd aktualizacji statystyk w tle:", e.message);
+    }
+    
+    setTimeout(updateStatsInBackground, cachedStatsUpdateInterval);
+}
+
+updateStatsInBackground();
 
 async function addToPlaylists(playlistIds, tracksUri) {
     var responses = [];
     for (const playlistId of playlistIds) {
         try {
-            console.log(`Dodawanie utworu do playlisty o ID: ${playlistId}`);
+            log.debug(`Dodawanie utworu do playlisty o ID: ${playlistId}`);
             const addTrackResponse = await fetch(`https://api.spotify.com/v1/playlists/${playlistId}/items`, {
                 method: 'POST',
                 headers: {
@@ -47,11 +81,11 @@ async function addToPlaylists(playlistIds, tracksUri) {
             const response_json = await addTrackResponse.json();
             responses.push({ playlistId, snapshot_id: response_json.snapshot_id });
             if (!addTrackResponse.ok) {
-                console.error("Błąd API Spotify:", response_json);
+                log.error("Błąd API Spotify:", response_json);
                 return { success: false, error: response_json.error };
             }
         } catch (error) {
-            console.error("Nieoczekiwany błąd:", error);
+            log.error("Nieoczekiwany błąd:", error);
             return { success: false, error: error.message };
         }
     }
@@ -85,21 +119,7 @@ app.get('/callback', (req, res) => {
 });
 
 app.get('/api/stats', async (req, res) => {
-    try {
-        const cpu = await si.currentLoad();
-        const mem = await si.mem();
-        const gpu = await si.graphics();
-        res.json({
-            cpuLoad: Math.round(cpu.currentLoad),
-            memUsed: Math.round((mem.active / mem.total) * 100),
-            gpuLoad: gpu.controllers.map(controller => ({
-                model: controller.model,
-                load: controller.utilizationGpu
-            }))
-        });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    res.json(cachedStats);
 });
 
 app.get('/api/spotify/current', async (req, res) => {
@@ -164,7 +184,7 @@ app.post('/api/spotify/:action', async (req, res) => {
     } catch (e) {
         if (e.statusCode === 404) {
             try {
-                console.log("Urządzenie uśpione. Próbuję wybudzić...");
+                log.debug("Urządzenie uśpione. Próbuję wybudzić...");
                 
                 const devicesData = await spotifyApi.getMyDevices();
                 const devices = devicesData.body.devices;
@@ -175,19 +195,19 @@ app.post('/api/spotify/:action', async (req, res) => {
                     // Wysyłamy komendę Play z wymuszeniem konkretnego ID
                     await spotifyApi.play({ device_id: targetDeviceId });
                     
-                    console.log("Urządzenie wybudzone i odtwarzanie wznowione.");
+                    log.debug("Urządzenie wybudzone i odtwarzanie wznowione.");
                     return res.status(200).json({ message: "Wybudzono urządzenie i wznowiono odtwarzanie" });
                 } else {
                     return res.status(404).json({ error: "Brak włączonych urządzeń ze Spotify. Otwórz aplikację na komputerze." });
                 }
             } catch (fallbackError) {
-                console.error("Błąd wybudzania:", fallbackError);
+                log.error("Błąd wybudzania:", fallbackError);
                 return res.status(500).json({ error: "Nie udało się wybudzić urządzenia." });
             }
         }
         
         // Obsługa innych błędów
-        console.error("Inny błąd odtwarzania:", e);
+        log.error("Inny błąd odtwarzania:", e);
         res.status(500).json({ error: "Wystąpił problem z odtwarzaniem." });
     }
 });
@@ -203,13 +223,25 @@ setInterval(async () => {
         if (spotifyApi.getRefreshToken()) {
             const data = await spotifyApi.refreshAccessToken();
             spotifyApi.setAccessToken(data.body['access_token']);
-            console.log('Token odświeżony automatycznie w tle.');
+            log.debug('Token odświeżony automatycznie w tle.');
         }
     } catch (e) {
-        console.error('Błąd cyklicznego odświeżania tokenu:', e.message);
+        log.error('Błąd cyklicznego odświeżania tokenu:', e.message);
     }
 }, 45 * 60 * 1000);
 
-app.listen(PORT, () => {
-    console.log(`Serwer działa na porcie ${PORT}. Zaloguj się: http://localhost:${PORT}/login`);
+app.listen(PORT, async () => {
+    try {
+        const netInterfaces = await si.networkInterfaces();
+        // Szukamy fizycznej karty sieciowej (nie wirtualnej) z adresem IPv4, ignorując localhost
+        const mainIface = netInterfaces.find(
+            iface => iface.ip4 && iface.ip4 !== '127.0.0.1' && !iface.virtual && !iface.internal
+        );
+        const ip = mainIface ? mainIface.ip4 : 'localhost';
+        
+        log(`Serwer działa! Otwórz dashboard: http://${ip}:${PORT}/app`.green.bold);
+    } catch (e) {
+        // console.error("Nie udało się pobrać IP:", e);
+        log.error(`Nie udało się pobrać IP komputera. Sprawdź je ręcznie. Serwer działa na porcie ${PORT}.`);
+    }
 });

@@ -1,2 +1,2 @@
 cd backend
-node server
+node test
